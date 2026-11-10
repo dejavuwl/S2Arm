@@ -437,6 +437,90 @@ class LockedProbe(Base):
         self.assertIn(f"{RP}/index.tsv", self.dev.files)
 
 
+class InflightProgress(Base):
+    def test_child_progress_is_delivered_before_child_exit(self):
+        # 子进程必须等回调写确认文件才退出；capture_output 等退出的旧实现必红。
+        script = self.w / "child.py"; ack = self.w / "ack"
+        script.write_text('''import pathlib, sys, time
+print("S2A_DEVPUSH_PROGRESS 40", flush=True)
+end = time.monotonic() + 2
+while not pathlib.Path(sys.argv[-1]).exists() and time.monotonic() < end:
+    time.sleep(0.01)
+sys.exit(0 if pathlib.Path(sys.argv[-1]).exists() else 1)
+''')
+        dev = push.Devpush(sys.executable, "-u", str(script), self.w)
+        seen = []
+        def report(n): seen.append(n); ack.touch()
+        dev.progress = report
+        dev.put(self.pk / "a", ack)
+        self.assertEqual(seen, [40])
+
+    def test_old_helper_output_still_succeeds_without_progress(self):
+        script = self.w / "old.py"
+        script.write_text('print("put 1 字节")\n', encoding="utf-8")
+        dev = push.Devpush(sys.executable, "-u", str(script), self.w)
+        seen = []; dev.progress = seen.append
+        dev.put(self.pk / "a", "remote")
+        self.assertEqual(seen, [])
+        self.assertIn("put 1 字节", (self.w / "devpush.log").read_text())
+
+    def test_streaming_error_keeps_diagnostics(self):
+        script = self.w / "fail.py"
+        script.write_text('import sys\nprint("S2A_DEVPUSH_PROGRESS 40", flush=True)\nprint("AFC write failed", file=sys.stderr)\nsys.exit(1)\n')
+        dev = push.Devpush(sys.executable, "-u", str(script), self.w)
+        seen = []; dev.progress = seen.append
+        with self.assertRaisesRegex(push.Fail, "AFC write failed"):
+            dev.put(self.pk / "a", "remote")
+        self.assertEqual(seen, [40])
+
+    def image_plan(self):
+        (self.pk / "romfs.img").write_bytes(b"x" * 100)
+        (self.w / "direct_img.tsv").write_text("romfs.img\t100\timage-sha\n")
+
+    def test_image_inflight_is_bounded_and_not_completed_or_ledgered(self):
+        self.image_plan(); dev = Fake({}); calls = []
+        def put_big(*args):
+            for n in (40, 20, 100, 999): dev.progress(n)
+            self.assertFalse((self.w / "pushed").exists())
+        dev.put_big = put_big
+        push.send(dev, self.pk, self.w, progress=lambda *a: calls.append(a))
+        self.assertEqual(calls, [(0, 100, 0, 1), (40, 100, 0, 1), (99, 100, 0, 1), (100, 100, 1, 1)])
+        self.assertIsNone(dev.progress)
+
+    def test_partial_image_failure_never_reports_completion(self):
+        self.image_plan(); dev = Fake({}); calls = []
+        def put_big(*args):
+            dev.progress(40); raise push.Fail("断开")
+        dev.put_big = put_big
+        with self.assertRaises(push.Fail):
+            push.send(dev, self.pk, self.w, progress=lambda *a: calls.append(a))
+        self.assertEqual(calls, [(0, 100, 0, 1), (40, 100, 0, 1)])
+        self.assertNotIn(f"{RP}/.pushed", dev.files)
+        self.assertIsNone(dev.progress)
+
+    def test_batches_add_payload_to_completed_bytes(self):
+        (self.w / "push_000.tsv").write_text("a\t1\ta-sha\n")
+        (self.w / "push_001.tsv").write_text("b\t2\tb-sha\n")
+        dev = Fake({}); calls = []
+        put_tar = dev.put_tar
+        def streaming(*args):
+            dev.progress(1)
+            return put_tar(*args)
+        dev.put_tar = streaming
+        push.send(dev, self.pk, self.w, progress=lambda *a: calls.append(a))
+        self.assertEqual(calls, [(0, 3, 0, 2), (1, 3, 1, 2), (2, 3, 1, 2), (3, 3, 2, 2)])
+
+    def test_mac_delegates_inflight_to_devpush(self):
+        self.image_plan(); calls = []
+        dev = push.Devicectl("device", "bundle", self.w)
+        dev.why = "合成流式工具"
+        dev.dp = Fake({}); dev.put = lambda *a: None
+        dev.dp.put = lambda *a: dev.dp.progress(40)
+        push.send(dev, self.pk, self.w, progress=lambda *a: calls.append(a))
+        self.assertEqual(calls, [(0, 100, 0, 1), (40, 100, 0, 1), (100, 100, 1, 1)])
+        self.assertIsNone(dev.dp.progress)
+
+
 class SendFail(Base):
     def test_nospc(self):
         with self.assertRaises(push.Fail) as e: self.go({}, full_disk=True)

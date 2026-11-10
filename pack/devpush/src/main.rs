@@ -11,8 +11,115 @@
 //   s2a-devpush <udid> <包名> launch [变量=值…]     起 App（先结束在跑的同包进程），带环境变量；打印 pid。Windows 测试台起局 / 只解包用（Mac 用 devicectl）：
 //     经 lockdown 的 CoreDeviceProxy 建用户态隧道（不要管理员、不装驱动）→ RSD → CoreDevice app_service（同 Xcode / devicectl 的起 App 服务；iOS 17+，要开发者模式与已挂开发者镜像）
 // 退出码：0 成功；1 连不上 / 读写失败（错误打到标准错误）
+// S2A_DEVPUSH_PROGRESS=1：put / put-tar（及本地 tar 对照）约每秒输出 S2A_DEVPUSH_PROGRESS <已刷出有效载荷字节>，不含 tar 头与补齐。
 use idevice::{IdeviceService, afc::opcode::AfcFopenMode, core_device::CoreDeviceServiceClient, core_device_proxy::CoreDeviceProxy, house_arrest::HouseArrestClient, rsd::RsdHandshake, usbmuxd::{UsbmuxdAddr, UsbmuxdConnection}};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
+use std::time::{Duration, Instant};
+
+// 仅显式请求时输出机器行；有效载荷不含 tar 头 / 补齐，只有 flush 成功才上报。
+struct Progress<F> {
+    enabled: bool,
+    last: Instant,
+    interval: Duration,
+    emit: F,
+}
+
+impl<F: FnMut(u64)> Progress<F> {
+    async fn report<W: AsyncWrite + Unpin>(&mut self, w: &mut W, payload: u64) -> Result<(), String> {
+        if self.enabled && self.last.elapsed() >= self.interval {
+            w.flush().await.map_err(|e| format!("写入刷新失败：{e}"))?;
+            (self.emit)(payload);
+            self.last = Instant::now();
+        }
+        Ok(())
+    }
+}
+
+fn progress() -> Progress<impl FnMut(u64)> {
+    Progress {
+        enabled: std::env::var("S2A_DEVPUSH_PROGRESS").as_deref() == Ok("1"),
+        last: Instant::now(), interval: Duration::from_secs(1),
+        emit: |n| println!("S2A_DEVPUSH_PROGRESS {n}"),
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+    use std::{pin::Pin, task::{Context, Poll}};
+
+    fn recorder<'a>(seen: &'a mut Vec<u64>) -> Progress<impl FnMut(u64) + 'a> {
+        Progress { enabled: true, last: Instant::now(), interval: Duration::ZERO, emit: |n| seen.push(n) }
+    }
+
+    #[tokio::test]
+    async fn file_reports_chunks_before_eof_and_preserves_bytes() {
+        let input = vec![42u8; (2 << 20) + 3]; let mut output = Vec::new(); let mut seen = Vec::new();
+        let n = write_file(&mut input.as_slice(), &mut output, &mut recorder(&mut seen)).await.unwrap();
+        assert_eq!(n, 2_097_155);
+        assert_eq!(seen, [1_048_576, 2_097_152, 2_097_155]);
+        assert_eq!(output, input);
+    }
+
+    struct FlushFails;
+    impl AsyncWrite for FlushFails {
+        fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, b: &[u8]) -> Poll<std::io::Result<usize>> { Poll::Ready(Ok(b.len())) }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> { Poll::Ready(Err(std::io::Error::other("flush failed"))) }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> { Poll::Ready(Ok(())) }
+    }
+
+    #[tokio::test]
+    async fn failed_flush_does_not_report_buffered_bytes() {
+        let mut seen = Vec::new();
+        assert!(write_file(&mut &b"abc"[..], &mut FlushFails, &mut recorder(&mut seen)).await.is_err());
+        assert!(seen.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reporting_is_throttled_and_opt_in() {
+        let mut seen = Vec::new(); let mut output = Vec::new();
+        {
+            let mut p = recorder(&mut seen); p.interval = Duration::from_secs(3600);
+            p.report(&mut output, 10).await.unwrap();
+            p.interval = Duration::ZERO; p.enabled = false;
+            p.report(&mut output, 20).await.unwrap();
+            p.enabled = true; p.report(&mut output, 30).await.unwrap();
+        }
+        assert_eq!(seen, [30]);
+    }
+
+    #[tokio::test]
+    async fn tar_progress_counts_payload_not_headers_and_bytes_are_unchanged() {
+        // 同一个编码器的报告开 / 关对照；夹具是原创的 1003 字节，不连接设备。
+        let root = std::env::temp_dir().join(format!("s2a-progress-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("合成.bin"), vec![42u8; 1003]).unwrap();
+        let mut seen = Vec::new(); let mut output = Vec::new(); let mut silent = Vec::new();
+        let list = vec!["合成.bin".to_string()];
+        let n = write_tar(&mut output, &list, root.to_str().unwrap(), &mut recorder(&mut seen)).await.unwrap();
+        let mut ignored = Vec::new(); let mut p = recorder(&mut ignored); p.enabled = false;
+        write_tar(&mut silent, &list, root.to_str().unwrap(), &mut p).await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(seen, [1003]);
+        assert_eq!(n, 3584);
+        assert_eq!(output, silent);
+        assert!(output[output.len() - 1024..].iter().all(|b| *b == 0));
+    }
+}
+
+async fn write_file<R: AsyncRead + Unpin, W: AsyncWrite + Unpin, F: FnMut(u64)>(src: &mut R, dst: &mut W, progress: &mut Progress<F>) -> Result<u64, String> {
+    let mut w = tokio::io::BufWriter::with_capacity(4 << 20, dst);
+    let mut buf = vec![0u8; 1 << 20]; let mut total = 0;
+    loop {
+        let n = src.read(&mut buf).await.map_err(|e| format!("读文件失败：{e}"))?;
+        if n == 0 { break; }
+        w.write_all(&buf[..n]).await.map_err(|e| format!("写文件失败：{e}"))?;
+        total += n as u64;
+        progress.report(&mut w, total).await?;
+    }
+    w.flush().await.map_err(|e| format!("写文件失败：{e}"))?;
+    Ok(total)
+}
 
 // pax tar（11-06 Windows 端到端线：push_win 原先每批先在出包机盘上打 1 GB 临时 tar 再整文件写进手机，和同机出包抢盘，旷野之息推包最慢 4.6 MB/s）：
 //   手机端 runtime/src/pack_apply.c 只认普通文件 + pax 扩展头（path / size），结尾两块全零。每个文件都发一条 pax 头带完整路径（不受 ustar 100 字节名限制），
@@ -37,11 +144,11 @@ fn pax_record(key: &str, val: &[u8]) -> Vec<u8> {   // 「长度 键=值\n」，
     let mut r = format!("{n} {key}=").into_bytes(); r.extend_from_slice(val); r.push(b'\n'); r
 }
 
-async fn write_tar<W: AsyncWrite + Unpin>(w: &mut W, list: &[String], root: &str) -> Result<u64, String> {
+async fn write_tar<W: AsyncWrite + Unpin, F: FnMut(u64)>(w: &mut W, list: &[String], root: &str, progress: &mut Progress<F>) -> Result<u64, String> {
     // 写缓冲 4 MB：AFC 每次 write 是一次往返，小文件每个要写头 / 内容 / 补齐三次（11-06 Windows 出包机原生 USB 推王国之泪：第 1 批 15.4 万个文件平均 6 KB，
     //   本地打包 16.6 秒、经 USB 约 1100 秒，全包 30.5 万个文件 19.2 GB 用 2696 秒、平均 7.1 MB/s）。合并成大块再发；大于缓冲的写直接透传
     let mut w = tokio::io::BufWriter::with_capacity(4 << 20, w);
-    let mut total = 0u64; let mut buf = vec![0u8; 1 << 20];
+    let mut total = 0u64; let mut payload = 0u64; let mut buf = vec![0u8; 1 << 20];
     for rel in list {
         let path = std::path::Path::new(root).join(rel);
         let mut f = tokio::fs::File::open(&path).await.map_err(|e| format!("读不了 {}：{e}", path.display()))?;
@@ -58,6 +165,8 @@ async fn write_tar<W: AsyncWrite + Unpin>(w: &mut W, list: &[String], root: &str
             f.read_exact(&mut buf[..k]).await.map_err(|e| format!("读 {rel} 失败：{e}"))?;
             w.write_all(&buf[..k]).await.map_err(|e| format!("写 {rel} 失败：{e}"))?;
             left -= k as u64; total += k as u64;
+            payload += k as u64;
+            progress.report(&mut w, payload).await?;
         }
         let pad = ((512 - size % 512) % 512) as usize;
         if pad > 0 { w.write_all(&vec![0u8; pad]).await.map_err(|e| e.to_string())?; total += pad as u64; }
@@ -87,7 +196,7 @@ async fn run(a: &[String]) -> Result<(), String> {
     }
     if op == "tar-local" {
         let mut f = tokio::fs::File::create(&a[6]).await.map_err(|e| format!("建不了 {}：{e}", a[6]))?;
-        let n = write_tar(&mut f, &read_list(&a[4])?, &a[5]).await?;
+        let n = write_tar(&mut f, &read_list(&a[4])?, &a[5], &mut progress()).await?;
         println!("tar-local {n} 字节 → {}", a[6]); return Ok(());
     }
     // 找设备与连设备走同一个设备服务地址（USBMUXD_SOCKET_ADDRESS，缺省本机）：原先找设备固定连本机、连设备才看环境变量，
@@ -144,14 +253,7 @@ async fn run(a: &[String]) -> Result<(), String> {
             let mut src = tokio::fs::File::open(local).await.map_err(|e| format!("读不了 {local}：{e}"))?;   // 流式：镜像可达十几 GB，不整份读进内存
             let f = afc.open(remote.clone(), AfcFopenMode::WrOnly).await.map_err(|e| format!("打不开 {remote}：{e}"))?;
             let mut f = Box::pin(f);
-            let mut w = tokio::io::BufWriter::with_capacity(4 << 20, &mut f);
-            let mut buf = vec![0u8; 1 << 20]; let mut total = 0u64;
-            loop {
-                let n = src.read(&mut buf).await.map_err(|e| format!("读 {local} 失败：{e}"))?;
-                if n == 0 { break; }
-                w.write_all(&buf[..n]).await.map_err(|e| format!("写 {remote} 失败：{e}"))?; total += n as u64;
-            }
-            w.flush().await.map_err(|e| format!("写 {remote} 失败：{e}"))?;
+            let total = write_file(&mut src, &mut f, &mut progress()).await.map_err(|e| format!("推 {remote} 失败：{e}"))?;
             println!("put {total} 字节 → {remote}");
         }
         "put-tar" => {
@@ -160,7 +262,7 @@ async fn run(a: &[String]) -> Result<(), String> {
             let mut cur = String::new();
             for p in parts { if p.is_empty() { continue; } cur = if cur.is_empty() { p.to_string() } else { format!("{cur}/{p}") }; let _ = afc.mk_dir(cur.clone()).await; }
             let mut f = afc.open(remote.clone(), AfcFopenMode::WrOnly).await.map_err(|e| format!("打不开 {remote}：{e}"))?;
-            let n = write_tar(&mut f, &list, root).await?;
+            let n = write_tar(&mut f, &list, root, &mut progress()).await?;
             println!("put-tar {} 个文件 {n} 字节 → {remote}", list.len());
         }
         "tar-ok" => {
