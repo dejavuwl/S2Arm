@@ -50,9 +50,8 @@ def release_identity(engine_json):
                                            stderr=subprocess.DEVNULL).strip()
         except (OSError, subprocess.CalledProcessError):
             return ""
-    tag = git("describe", "--tags", "--abbrev=0")
-    match = re.match(r"v?(\d+(?:\.\d+)*)", tag)
-    short_version = match.group(1) if match else "0.1.0"
+    sys.path.insert(0, str(ROOT / "pack/jobs")); from core import release_version
+    short_version = release_version(ROOT) or "0.1.0"   # 同 iPhone 容器、Windows 启动器（三端同号，pack/jobs/core.py）
     build = git("rev-list", "--count", "HEAD") or "1"
     commit = git("rev-parse", "--short=8", "HEAD") or "unknown"
     dirty = "-dirty" if git("status", "--porcelain", "--untracked-files=no") else ""

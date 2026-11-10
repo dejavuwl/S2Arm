@@ -141,6 +141,10 @@ public static class PackCases
         check((string?)V3("relinkGame", new() { ["folder"] = where })["folder"] == where, "request: relinkGame carries the chosen folder");
         check(V3("forgetGame", null).Count == move.Count - 1, "request: forgetGame is the bare envelope");
         check((string?)V3("clean", new() { ["kind"] = "cache" })["kind"] == "cache", "request: clean kind=cache accepted");
+        // 释放空间（同 Mac FreeSpaceView）：spaceFree 带这款和勾选的部件列表，原样交给 pack/jobs/library.py space_free
+        var free = V3("spaceFree", new() { ["parts"] = new[] { "shaders", "ipa" } });
+        check((string?)free["operation"] == "spaceFree" && (string?)free["gameId"] == "0100FD70134FA000" && free["parts"] is string[] { Length: 2 } ps && ps[0] == "shaders" && ps[1] == "ipa",
+              "request: spaceFree carries the game and the chosen parts");
         check((string?)V3("ipa", new() { ["location"] = where })["location"] == where && !V3("ipa", null).ContainsKey("location"),
             "request: ipa location optional, passed through when chosen");
         foreach (var (operation, extra, label) in new (string, Dictionary<string, object?>?, string)[]

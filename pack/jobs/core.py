@@ -155,6 +155,25 @@ def _sha256():
     return sha256_fast.new()
 
 
+def release_version(engine):
+    """S2Arm 发版号（三端同号：Mac 启动器、Windows 启动器、iPhone 容器都显示这一个，11-09 维护者）：
+    发布的引擎快照读打包时写进 engine.json 的 version；开发树取最近 tag 的数字段（v0.2.3-beta.1 → 0.2.3，同 Mac build_app）。取不到 → 空串"""
+    eng = Path(engine) / "engine.json"
+    if eng.is_file():
+        try:
+            v = json.loads(eng.read_text(encoding="utf-8")).get("version")
+            if isinstance(v, str) and v:
+                return v
+        except (OSError, ValueError):
+            pass
+    try:
+        tag = subprocess.run(["git", "-C", str(engine), "describe", "--tags", "--abbrev=0"], capture_output=True, text=True, timeout=30).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    m = re.match(r"v?(\d+(?:\.\d+)*)", tag)
+    return m.group(1) if m else ""
+
+
 def digest(path, progress=None):
     h = _sha256()
     done = 0

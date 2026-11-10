@@ -4,6 +4,7 @@ using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Layout;
 using Avalonia.Media;
+using System.Text.Json;
 using S2Arm.Launcher.Protocol;
 
 namespace S2Arm.Launcher;
@@ -16,6 +17,11 @@ public sealed partial class EnvironmentWindow
     private StorageOverview? overview;
     private bool overviewLoading;
     private string overviewError = "";
+    // 释放空间（同 Mac FreeSpaceView：spaceSurvey 每款按部件列占用、勾选后 spaceFree 直接删；存档和日志只报不删）
+    private JsonElement? survey;
+    private readonly Dictionary<string, HashSet<string>> freeChosen = new();
+    private bool freeing;
+    private string freeNote = "";
 
     private static readonly string[] SizeParts = ["imageIos", "saves", "cache", "sources"];
 
@@ -39,6 +45,83 @@ public sealed partial class EnvironmentWindow
         libraryFolder = libraryFolderBox.Text ?? "";
         Navigate("storage");
         _ = LoadOverviewAsync();
+        _ = LoadSurveyAsync();
+    }
+
+    private async Task LoadSurveyAsync()
+    {
+        if (connectedFolder is null || libraryId is null) return;
+        try
+        {
+            var job = await LibraryJobClient.RunAsync(paths, privateRoot, connectedFolder, libraryId, "spaceSurvey", null, CancellationToken.None);
+            if (job.Report.Succeeded) survey = job.Report.Result.Clone();
+            else overviewError = job.Report.Message;
+        }
+        catch (Exception error) when (error is LibraryProtocolException or IOException or UnauthorizedAccessException or ArgumentException or
+            InvalidOperationException or System.ComponentModel.Win32Exception or KeyNotFoundException)
+        { overviewError = error.Message; }
+        if (page == "storage") Render();
+    }
+
+    private async Task FreeAsync(string gameId, string name, IReadOnlyList<string> parts, long bytes)
+    {
+        if (freeing || packRunning || installBusy) { freeNote = T("space.busy"); Render(); return; }
+        var body = T("space.free_body").Replace("{0}", string.Join("、", parts.Select(p => T("space.part." + p)))).Replace("{1}", name);
+        if (!await ConfirmInstallActionAsync("space.free", body.Replace("{2}", FormatBytes(bytes)))) return;
+        freeing = true; freeNote = ""; Render();
+        try
+        {
+            var job = await PackJobClient.RunAsync(PackRequest("spaceFree", gameId, new Dictionary<string, object?> { ["parts"] = parts }), null, CancellationToken.None);
+            freeNote = job.Report.Succeeded && job.Report.Result.TryGetProperty("freedBytes", out var f) && f.TryGetInt64(out var freed)
+                ? T("space.freed").Replace("{0}", FormatBytes(freed)) : job.Report.Message;
+            freeChosen.Remove(gameId);
+        }
+        catch (Exception error) when (error is LibraryProtocolException or IOException or UnauthorizedAccessException or ArgumentException or
+            InvalidOperationException or OperationCanceledException or System.ComponentModel.Win32Exception)
+        { freeNote = error.Message; }
+        finally { freeing = false; }
+        await LoadSurveyAsync(); await LoadOverviewAsync(); await RunLibraryAsync("catalog", null);
+    }
+
+    /// <summary>释放空间卡片：每款列可删的部件（勾选）、保留的部件（只报大小），勾了才给「释放」。</summary>
+    private Control FreeSpaceCard(JsonElement result)
+    {
+        var card = new StackPanel { Spacing = 12 };
+        card.Children.Add(Label(T("space.title"), 18));
+        card.Children.Add(Muted(T("space.direct"), 12));
+        if (freeNote.Length > 0) card.Children.Add(Label(freeNote));
+        foreach (var g in result.GetProperty("games").EnumerateArray())
+        {
+            var gid = g.GetProperty("gameId").GetString() ?? ""; var name = g.GetProperty("name").GetString() ?? gid;
+            var parts = g.GetProperty("parts").EnumerateArray().Select(p => (Id: p.GetProperty("id").GetString() ?? "", Bytes: p.GetProperty("bytes").GetInt64()))
+                .Where(p => p.Bytes > 0).ToList();
+            var row = new StackPanel { Spacing = 4 };
+            row.Children.Add(Label(name, 15));
+            var chosen = freeChosen.TryGetValue(gid, out var set) ? set : freeChosen[gid] = new HashSet<string>();
+            foreach (var (id, bytes) in parts)
+            {
+                var box = new CheckBox { IsChecked = chosen.Contains(id), IsEnabled = !freeing,
+                    Content = new StackPanel { Spacing = 1, Children = { Label(T("space.part." + id) + " · " + FormatBytes(bytes)), Muted(T("space.part." + id + ".rebuild"), 12) } } };
+                AutomationId(box, "space." + gid + "." + id);
+                box.IsCheckedChanged += (_, _) => { if (box.IsChecked == true) chosen.Add(id); else chosen.Remove(id); Render(); };
+                row.Children.Add(box);
+            }
+            var kept = g.GetProperty("kept").EnumerateArray().Select(k => T("space.kept." + k.GetProperty("id").GetString()) + " " + FormatBytes(k.GetProperty("bytes").GetInt64()));
+            row.Children.Add(Muted(T("space.kept") + " · " + string.Join(" · ", kept), 12));
+            if (parts.Count == 0) row.Children.Add(Muted(T("space.nothing"), 12));
+            else
+            {
+                var total = parts.Where(p => chosen.Contains(p.Id)).Sum(p => p.Bytes);
+                var free = Action("space.free", () => _ = FreeAsync(gid, name, parts.Where(p => chosen.Contains(p.Id)).Select(p => p.Id).ToList(), total),
+                    chosen.Count > 0 && !freeing);
+                AutomationId(free, "space.free." + gid);
+                if (total > 0) row.Children.Add(Muted(T("space.total").Replace("{0}", FormatBytes(total)), 12));
+                row.Children.Add(free);
+            }
+            card.Children.Add(row);
+        }
+        card.Children.Add(Muted(T("space.keptNote"), 12));
+        return Card(card);
     }
 
     private async Task LoadOverviewAsync()
@@ -63,7 +146,7 @@ public sealed partial class EnvironmentWindow
         var head = new Grid { ColumnDefinitions = new ColumnDefinitions("*,Auto,Auto"), ColumnSpacing = 10 };
         var title = Label(T("storage.title"), 23); title.VerticalAlignment = VerticalAlignment.Center;
         head.Children.Add(title);
-        var again = Action("storage.refresh", () => _ = LoadOverviewAsync(), !overviewLoading && libraryId is not null);
+        var again = Action("storage.refresh", () => { _ = LoadOverviewAsync(); _ = LoadSurveyAsync(); }, !overviewLoading && libraryId is not null);
         AutomationId(again, "storage.refresh");
         Grid.SetColumn(again, 1); head.Children.Add(again);
         var back = Action("nav.library", () => Navigate("library"));
@@ -115,5 +198,6 @@ public sealed partial class EnvironmentWindow
         }
         games.Children.Add(Muted(T("library.sizes.sourcesNote"), 12));
         body.Children.Add(Card(games));
+        if (survey is { } s) body.Children.Add(FreeSpaceCard(s));
     }
 }

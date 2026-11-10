@@ -74,7 +74,7 @@ public static class PackJobClient
 {
     public static readonly IReadOnlySet<string> Operations =
         new HashSet<string>(StringComparer.Ordinal) { "ipa", "installCheck", "install", "installRemove", "installRestore", "customize",
-            "moveGame", "relinkGame", "forgetGame", "clean", "delete" };
+            "moveGame", "relinkGame", "forgetGame", "clean", "delete", "spaceFree" };
 
     public sealed record Request(LauncherPaths Paths, string PrivateRoot, string Library, string LibraryId, string Operation,
         string GameId, IReadOnlyDictionary<string, object?>? Extra = null);

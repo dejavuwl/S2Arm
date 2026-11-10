@@ -692,6 +692,16 @@ namespace Ryujinx.HLE.HOS.Services.Am.AppletOE.ApplicationProxyService.Applicati
             return ResultCode.Success;
         }
 
+        [CommandCmif(330)] // 20.0.0+
+        // 未命名（Switch 2 SDK 起局后约 1 秒读一个字节，#368 一款动作游戏没有它就 ResultSfUnknownMethodId 自己 Break 退出）-> u8：
+        //   回 0（按社区已知的命令格式：输出一个字节、回 0，代码自写；语义未知，0 让游戏继续）
+        public ResultCode GetUnknown330(ServiceCtx context)
+        {
+            context.ResponseData.Write((byte)0);
+
+            return ResultCode.Success;
+        }
+
         [CommandCmif(210)] // 20.0.0+
         // GetUnknownEvent() -> handle<copy>
         //   S2Arm：Switch 2 进程上这是 GetOperationModeRefreshEvent，交出随模式切换触发的事件（AppletStateMgr.OperationModeRefreshEvent 注释）；

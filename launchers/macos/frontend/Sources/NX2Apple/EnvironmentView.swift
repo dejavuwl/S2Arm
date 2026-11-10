@@ -89,6 +89,10 @@ struct EnvironmentView: View {
                             }
                         }
                     }
+                    // 版本号（三端同号：Windows 启动器、iPhone 上的 S2Arm 显示同一个，装机时写进 iPhone 那份）
+                    Text(verbatim: "S2Arm " + (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "-"))
+                        .font(.manrope(12)).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .center)
+                        .accessibilityIdentifier("env.version")
                 }
                 .padding(.horizontal, 30).padding(.bottom, 24)
             }

@@ -271,6 +271,10 @@ public sealed partial class EnvironmentWindow : Window
                 Content = new TextBox { Text = diagnostics, IsReadOnly = true, AcceptsReturn = true,
                     TextWrapping = TextWrapping.Wrap, MaxHeight = 260 } });
         }
+        // Version: the same number the Mac launcher and the S2Arm on the iPhone show (written into the iPhone app at install).
+        var version = Muted("S2Arm " + AppVersion, 12); version.HorizontalAlignment = HorizontalAlignment.Center;
+        Avalonia.Automation.AutomationProperties.SetAutomationId(version, "env.version");
+        body.Children.Add(version);
         Content = new ScrollViewer { Content = body, HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled };
     }
 

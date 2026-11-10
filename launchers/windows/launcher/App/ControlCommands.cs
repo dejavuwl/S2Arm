@@ -173,7 +173,13 @@ public sealed partial class EnvironmentWindow
                 _ = CustomizeAsync(customized, r.Text("name"), r.Text("coverPath"));
                 return ControlReply.Ok();
             }
-            case ("POST", "/delete"): return ControlReply.Bad("Windows 启动器还不能删除游戏", 409);
+            case ("POST", "/delete"):   // 同界面「删除这款游戏」（delete 作业）；控制口不弹确认，由 AI 先问过玩家
+            {
+                if (ControlBusy) return Busy();
+                if (ControlGame(r) is not { } doomed) return NoGame;
+                BeginGameJob("delete", doomed);
+                return ControlReply.Ok();
+            }
             case ("POST", "/diagnostics"):
             {
                 if (r.Text("action") == "pull") return ControlReply.Bad("Windows 版不能拉回 iPhone 诊断：装机日志用 s2armctl logs 读", 409);

@@ -330,6 +330,7 @@ public sealed partial class EnvironmentWindow
         menu.Items.Add(new Separator());
         Add(T("install.remove_game"), "remove", () => { libraryFolder = libraryFolderBox.Text ?? ""; selectedGame = game.Id; Navigate("install"); _ = ConfirmRemoveAsync(game); },
             !libraryBusy && !installBusy && !packRunning);
+        Add(T("game.diag"), "diag", () => _ = ExportDiagnosticsAsync(), idle);   // 同 Mac「更多 → 导出诊断包」
         Add(T("game.delete"), "delete", () => _ = ConfirmDeleteAsync(game), idle);
         return menu;
     }
@@ -382,6 +383,25 @@ public sealed partial class EnvironmentWindow
     private bool deleteOpen;
 
     /// <summary>「删除这款游戏」确认（同 Mac 的 game.delete 弹窗）：确认后跑 delete 作业。</summary>
+    /// <summary>导出诊断包（diagnostics 作业，同 Mac / 控制口 /diagnostics export）：玩家选保存位置，作业层脱敏打包。</summary>
+    private async Task ExportDiagnosticsAsync()
+    {
+        if (connectedFolder is null || libraryId is null || libraryBusy) return;
+        var file = await StorageProvider.SaveFilePickerAsync(new FilePickerSaveOptions { Title = T("game.diag"), SuggestedFileName = "S2Arm-diagnostics.zip", DefaultExtension = "zip" });
+        if (file?.TryGetLocalPath() is not { } output) return;
+        libraryBusy = true; librarySummary = "library.working"; Render();
+        try
+        {
+            var job = await LibraryJobClient.RunAsync(paths, privateRoot, connectedFolder, libraryId, "diagnostics", [output], CancellationToken.None);
+            DisplayJob(job);
+            librarySummary = job.Report.Succeeded ? "library.completed" : "library.failed";
+        }
+        catch (Exception error) when (error is LibraryProtocolException or IOException or UnauthorizedAccessException or ArgumentException or
+            InvalidOperationException or OperationCanceledException or System.ComponentModel.Win32Exception)
+        { librarySummary = "library.failed"; libraryDiagnostics += "\n" + error.Message; }
+        finally { libraryBusy = false; Render(); }
+    }
+
     private async Task ConfirmDeleteAsync(LibraryGame game)
     {
         if (deleteOpen || BusyFor(game)) return;

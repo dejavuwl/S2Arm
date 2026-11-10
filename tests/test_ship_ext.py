@@ -240,12 +240,12 @@ class ContainerTest(unittest.TestCase):
         (root / "ctl").mkdir(); (root / "ctl/control.nacp").write_bytes(bytes(nacp))
         return root
 
-    def run_c(self, d, shell, out, roots, base=None):
+    def run_c(self, d, shell, out, roots, base=None, version=None):
         from PIL import Image
         icon = Path(d) / "brand.png"
         if not icon.exists(): Image.new("RGB", (64, 64), (1, 2, 3)).save(icon)
         cmd = [sys.executable, str(REPO / "pack/ship_ext.py"), "container", "--shell", str(shell), "--out", str(out), "--bundle-id", "dev.example.games", "--icon", str(icon), "--host-abi", "7"]
-        cmd += [x for r in roots for x in ("--game", str(r))] + (["--base", str(base)] if base else [])
+        cmd += [x for r in roots for x in ("--game", str(r))] + (["--base", str(base)] if base else []) + (["--version", version] if version else [])
         return subprocess.run(cmd, capture_output=True, text=True,
                               env={**os.environ, "S2A_BANNER_FETCH": "0"})   # 单测零联网：抓图关掉，A 的 banner 走产物根自带拷贝路径
 
@@ -257,6 +257,17 @@ class ContainerTest(unittest.TestCase):
         self.b = self.game(self.d, "b", 3, 0x1000, 0x0100000000020000, "乙游戏", b"")
 
     def tearDown(self): self.td.cleanup()
+
+    def test_version_written_into_info_plist(self):
+        # 三端同号：电脑上 S2Arm 的发版号写进容器 Info.plist 的 CFBundleShortVersionString；不给 --version 就沿用壳里的
+        import plistlib
+        r = self.run_c(self.d, self.shell, self.d / "v1/S2Arm.app", [self.a], version="9.8.7")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(plistlib.loads((self.d / "v1/S2Arm.app/Info.plist").read_bytes())["CFBundleShortVersionString"], "9.8.7")
+        r = self.run_c(self.d, self.shell, self.d / "v2/S2Arm.app", [self.a])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        shell_v = plistlib.loads((self.shell / "root/Info.plist").read_bytes()).get("CFBundleShortVersionString")
+        self.assertEqual(plistlib.loads((self.d / "v2/S2Arm.app/Info.plist").read_bytes()).get("CFBundleShortVersionString"), shell_v)
 
     def test_layout_catalogue_and_window_max(self):
         r = self.run_c(self.d, self.shell, self.d / "o1/S2Arm.app", [self.a, self.b])
